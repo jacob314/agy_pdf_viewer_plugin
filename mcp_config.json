@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "pdf_viewer": {
+      "command": "bash",
+      "args": [
+        "${PLUGIN_ROOT}/bin/pdf-viewer-server",
+        "--data-dir=${PLUGIN_DATA}"
+      ]
+    }
+  }
+}
