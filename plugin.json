@@ -1,7 +1,7 @@
 {
   "name": "pdf-viewer",
   "displayName": "Inline PDF Viewer",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Interactive inline, side-panel, and click-to-open PDF viewer for Antigravity/Jetski with crisp Retina rendering, text selection, in-document search, table of contents, thumbnail strip, zoom/fit controls, single-page, 2-page book spread, continuous scroll, on-demand byte-range streaming for huge PDFs, and one-click Save Locally to ~/Downloads.",
   "author": {
     "name": "jacob314",

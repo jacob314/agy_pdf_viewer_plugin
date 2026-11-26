@@ -10,9 +10,10 @@ An interactive [Antigravity](https://antigravity.google) / Jetski plugin (`pdf-v
   - **Inline Chat Viewer (`view_pdf_inline`)**: Renders 1–5 `.pdf` files right inside the conversation with a one-click **Side Panel ↗** button that promotes the exact document, current page, view mode, and zoom straight into the side panel.
   - **Side Panel (`open_pdf_viewer`)**: Full-height auxiliary side pane (`PDF Viewer`) launchable from the side pane `+` menu or via tool calls (remembers the last session or accepts drag-and-drop PDFs).
   - **Custom `.pdf` File Viewer (`view_pdf_file`)**: Automatically claims `.pdf` files so clicking any PDF link or file in Antigravity opens it directly in the interactive PDF Viewer.
-- **Fast On-Demand Byte-Range Streaming**:
-  - Powered by bundled offline **PDF.js** (zero external network or CDN requests; runs cleanly under strict `default-src 'none'` CSP).
-  - PDFs over 4 MB automatically stream on demand via `PDFDataRangeTransport` in ≤512 KiB slices, so even **300+ MB** illustrated print books open in seconds without loading the entire file into memory.
+- **Fast Loopback HTTP Range Streaming & Persistent Registry**:
+  - Powered by bundled offline **PDF.js** (zero external CDN requests; runs cleanly under strict CSP with a token-authenticated `127.0.0.1` loopback HTTP/1.1 `206 Partial Content` range server).
+  - Opens **500+ MB**, 190-page illustrated print PDFs in under 1 second via 64 KiB on-demand HTTP byte ranges, with automatic fallback to chunked MCP transport (`PDFDataRangeTransport`) if loopback HTTP is unavailable.
+  - Persists recently viewed PDF paths in `registry.json` across restarts and automatically locates large (`>10 MiB`) PDFs clicked cold via opaque host URIs (`resolve_pdf_by_name`) so clicking any `.pdf` link works reliably without hitting host resource caps.
 - **Save Locally (`⌘S` / Download button)**:
   - One-click save to `~/Downloads` with non-clobbering filenames (`file.pdf`, `file_2.pdf`, …) and a copy-path confirmation toast—works for registered disk PDFs (instant copy even for 300+ MB files), clicked `file_viewer` PDFs, and drag-and-dropped files.
 - **Rich Reading & Layout Tools**:
@@ -73,7 +74,9 @@ Or simply **click any `.pdf` file** in Antigravity to open it directly in the PD
 | `view_pdf_inline` | Model & App | Inline Chat | Interactive inline PDF viewer for 1–5 files with zero-turn **Side Panel ↗** promotion |
 | `open_pdf_viewer` | Model & App | Side Panel (`aux_pane`) | Full-height side-panel viewer; restores last session on `{}` |
 | `view_pdf_file` | Host / App | File Viewer (`file`) | Custom click-to-open `.pdf` file handler |
-| `load_pdf_chunk` | App-only | Internal | Streams ≤512 KiB chunks or arbitrary byte ranges for `PDFDataRangeTransport` |
+| `get_pdf_source` | App-only | Internal | Refreshes disk metadata and returns the live loopback HTTP range-stream URL across restarts |
+| `resolve_pdf_by_name` | App-only | Internal | Cold-click disk lookup fallback for `>10 MiB` PDFs clicked via opaque host URIs |
+| `load_pdf_chunk` | App-only | Internal | Fallback chunk/range streamer (`<=512 KiB`) when loopback HTTP is unavailable |
 | `promote_pdf_to_pane` | App-only | Internal | Snapshots inline state (tabs, page, zoom, view mode) for instant `toggle-aux-pane` handoff |
 | `save_pdf_locally` | App-only | Internal | Fast server-side copy of a registered PDF into `~/Downloads` |
 | `save_pdf_chunk` | App-only | Internal | Chunked local saver to `~/Downloads` for `file_viewer` or dropped PDFs |

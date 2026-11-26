@@ -3760,7 +3760,7 @@ var require_schemes = __commonJS({
       urnComponent.nss = (uuidComponent.uuid || "").toLowerCase();
       return urnComponent;
     }
-    var http = (
+    var http2 = (
       /** @type {SchemeHandler} */
       {
         scheme: "http",
@@ -3773,7 +3773,7 @@ var require_schemes = __commonJS({
       /** @type {SchemeHandler} */
       {
         scheme: "https",
-        domainHost: http.domainHost,
+        domainHost: http2.domainHost,
         parse: httpParse,
         serialize: httpSerialize
       }
@@ -3817,7 +3817,7 @@ var require_schemes = __commonJS({
     var SCHEMES = (
       /** @type {Record<SchemeName, SchemeHandler>} */
       {
-        http,
+        http: http2,
         https,
         ws,
         wss,
@@ -7253,9 +7253,11 @@ var require_dist = __commonJS({
 
 // src/server/index.ts
 import fs from "node:fs";
+import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
+import { execFileSync } from "node:child_process";
 import { fileURLToPath, pathToFileURL } from "node:url";
 
 // node_modules/zod/v3/external.js
@@ -21571,6 +21573,7 @@ var StdioServerTransport = class {
 var APP_URI = "ui://pdf-viewer/app.html";
 var CHUNK_SIZE_BYTES = 524288;
 var PROMOTED_SESSION_TTL_MS = 3e4;
+var MAX_REGISTRY_ENTRIES = 150;
 var __dirname = path.dirname(fileURLToPath(import.meta.url));
 var PLUGIN_ROOT = path.resolve(__dirname, "..");
 var DATA_DIR = path.join(PLUGIN_ROOT, ".data");
@@ -21579,9 +21582,136 @@ for (const arg of process.argv.slice(2)) {
     DATA_DIR = arg.slice("--data-dir=".length);
   }
 }
+var STREAM_TOKEN = crypto.randomBytes(24).toString("hex");
+var streamOrigin = null;
 var registeredPdfs = /* @__PURE__ */ new Map();
 var pendingSaveUploads = /* @__PURE__ */ new Map();
 var pendingPromotedSession = null;
+function appendDebugLog(scope, detail) {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    const logFile = path.join(DATA_DIR, "debug.log");
+    if (fs.existsSync(logFile) && fs.statSync(logFile).size > 128e3) {
+      fs.writeFileSync(logFile, "", "utf8");
+    }
+    const line = `${(/* @__PURE__ */ new Date()).toISOString()} [${scope}] ${typeof detail === "string" ? detail : JSON.stringify(detail)}
+`;
+    fs.appendFileSync(logFile, line, "utf8");
+  } catch {
+  }
+}
+function buildStreamUrl(pdfId, mtimeMs) {
+  if (!streamOrigin) return void 0;
+  return `${streamOrigin}/pdf/${STREAM_TOKEN}/${pdfId}?v=${Math.floor(mtimeMs)}`;
+}
+function registryPath() {
+  return path.join(DATA_DIR, "registry.json");
+}
+function lastSessionPath() {
+  return path.join(DATA_DIR, "last_session.json");
+}
+function makePdfId(absPath) {
+  return crypto.createHash("sha256").update(absPath).digest("hex").slice(0, 16);
+}
+function registerSingleDiskPdf(absPath, label, initialPage = 1) {
+  const resolved = path.resolve(absPath);
+  if (!fs.existsSync(resolved)) {
+    throw new Error(`PDF file not found: ${resolved}`);
+  }
+  const stat = fs.statSync(resolved);
+  if (!stat.isFile()) {
+    throw new Error(`Path is not a file: ${resolved}`);
+  }
+  const ext = path.extname(resolved).toLowerCase();
+  if (ext !== ".pdf") {
+    throw new Error(`Unsupported file type "${ext}" for ${path.basename(resolved)}. Expected .pdf`);
+  }
+  const id = makePdfId(resolved);
+  const fileName = path.basename(resolved);
+  const cleanLabel = label && label.trim() || fileName.replace(/\.pdf$/i, "");
+  const meta = {
+    id,
+    label: cleanLabel,
+    fileName,
+    sizeBytes: stat.size,
+    mtimeMs: stat.mtimeMs,
+    initialPage: Math.max(1, Math.floor(initialPage || 1)),
+    streamUrl: buildStreamUrl(id, stat.mtimeMs)
+  };
+  registeredPdfs.delete(id);
+  registeredPdfs.set(id, { id, absPath: resolved, meta });
+  return meta;
+}
+function saveRegistry() {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    const entries = Array.from(registeredPdfs.values()).slice(-MAX_REGISTRY_ENTRIES).map((r) => ({
+      id: r.id,
+      absPath: r.absPath,
+      label: r.meta.label,
+      fileName: r.meta.fileName
+    }));
+    fs.writeFileSync(registryPath(), JSON.stringify(entries, null, 2), "utf8");
+  } catch {
+  }
+}
+function loadRegistry() {
+  try {
+    const p = registryPath();
+    if (fs.existsSync(p)) {
+      const raw = JSON.parse(fs.readFileSync(p, "utf8"));
+      if (Array.isArray(raw)) {
+        for (const entry of raw) {
+          if (!entry || typeof entry.absPath !== "string" || !fs.existsSync(entry.absPath)) continue;
+          try {
+            registerSingleDiskPdf(entry.absPath, entry.label, 1);
+          } catch {
+          }
+        }
+      }
+    }
+  } catch {
+  }
+  try {
+    const prev = loadLastSession();
+    if (prev) {
+      let seeded = false;
+      for (const f of prev.files) {
+        if (f?.path && fs.existsSync(f.path)) {
+          try {
+            registerSingleDiskPdf(f.path, f.label, f.page ?? 1);
+            seeded = true;
+          } catch {
+          }
+        }
+      }
+      if (seeded) saveRegistry();
+    }
+  } catch {
+  }
+}
+function saveLastSession(session) {
+  try {
+    fs.mkdirSync(DATA_DIR, { recursive: true });
+    fs.writeFileSync(lastSessionPath(), JSON.stringify(session, null, 2), "utf8");
+  } catch {
+  }
+}
+function loadLastSession() {
+  try {
+    const p = lastSessionPath();
+    if (!fs.existsSync(p)) return null;
+    const raw = JSON.parse(fs.readFileSync(p, "utf8"));
+    if (!raw || !Array.isArray(raw.files)) return null;
+    const existing = raw.files.filter(
+      (f) => typeof f?.path === "string" && fs.existsSync(f.path)
+    );
+    if (existing.length === 0) return null;
+    return { ...raw, files: existing.slice(0, 5) };
+  } catch {
+    return null;
+  }
+}
 function pickNonClobberingDownloadsPath(rawFileName) {
   const baseName = path.basename(rawFileName || "document.pdf");
   const rawStem = baseName.replace(/\.pdf$/i, "");
@@ -21598,8 +21728,11 @@ function pickNonClobberingDownloadsPath(rawFileName) {
 }
 function tryResolveLocalPdfPath(file) {
   const candidates = [];
-  if (typeof file.path === "string" && file.path) {
-    candidates.push(file.path);
+  for (const key of ["path", "filePath", "absPath", "absolutePath", "fsPath"]) {
+    const val = file[key];
+    if (typeof val === "string" && val) {
+      candidates.push(val);
+    }
   }
   for (const rawUri of [file.resourceUri, file.uri]) {
     if (typeof rawUri !== "string" || !rawUri) continue;
@@ -21636,64 +21769,108 @@ function tryResolveLocalPdfPath(file) {
   }
   return null;
 }
-function lastSessionPath() {
-  return path.join(DATA_DIR, "last_session.json");
-}
-function saveLastSession(session) {
-  try {
-    fs.mkdirSync(DATA_DIR, { recursive: true });
-    fs.writeFileSync(lastSessionPath(), JSON.stringify(session, null, 2), "utf8");
-  } catch {
+function findRegisteredByFileName(fileName) {
+  const target = path.basename(fileName || "").toLowerCase();
+  if (!target) return null;
+  let best = null;
+  for (const reg of Array.from(registeredPdfs.values()).reverse()) {
+    if (reg.meta.fileName.toLowerCase() !== target) continue;
+    try {
+      if (!fs.existsSync(reg.absPath)) continue;
+      const stat = fs.statSync(reg.absPath);
+      if (!stat.isFile()) continue;
+      if (!best || stat.mtimeMs > best.mtimeMs) {
+        best = { reg, mtimeMs: stat.mtimeMs };
+      }
+    } catch {
+    }
   }
+  return best?.reg ?? null;
 }
-function loadLastSession() {
-  try {
-    const p = lastSessionPath();
-    if (!fs.existsSync(p)) return null;
-    const raw = JSON.parse(fs.readFileSync(p, "utf8"));
-    if (!raw || !Array.isArray(raw.files)) return null;
-    const existing = raw.files.filter(
-      (f) => typeof f?.path === "string" && fs.existsSync(f.path)
-    );
-    if (existing.length === 0) return null;
-    return { ...raw, files: existing.slice(0, 5) };
-  } catch {
-    return null;
+function findPdfOnDiskByName(rawFileName) {
+  const baseName = path.basename(rawFileName || "");
+  if (!baseName || !baseName.toLowerCase().endsWith(".pdf")) return null;
+  const fromRegistry = findRegisteredByFileName(baseName);
+  if (fromRegistry) return fromRegistry.absPath;
+  const matches = [];
+  const seen = /* @__PURE__ */ new Set();
+  const consider = (p) => {
+    try {
+      const resolved = path.resolve(p);
+      if (seen.has(resolved)) return;
+      if (path.basename(resolved).toLowerCase() !== baseName.toLowerCase()) return;
+      if (!fs.existsSync(resolved)) return;
+      const stat = fs.statSync(resolved);
+      if (!stat.isFile()) return;
+      seen.add(resolved);
+      matches.push({ absPath: resolved, mtimeMs: stat.mtimeMs });
+    } catch {
+    }
+  };
+  if (process.platform === "darwin") {
+    try {
+      const escaped = baseName.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+      const out = execFileSync("mdfind", [`kMDItemFSName == "${escaped}"`], {
+        encoding: "utf8",
+        timeout: 2500,
+        maxBuffer: 2 * 1024 * 1024
+      });
+      for (const line of out.split("\n")) {
+        const trimmed = line.trim();
+        if (trimmed) consider(trimmed);
+      }
+    } catch {
+    }
   }
-}
-function makePdfId(absPath) {
-  return crypto.createHash("sha256").update(absPath).digest("hex").slice(0, 16);
+  if (matches.length === 0) {
+    const home = os.homedir();
+    for (const dir of [
+      path.join(home, "Downloads"),
+      path.join(home, "Desktop"),
+      path.join(home, "Documents")
+    ]) {
+      consider(path.join(dir, baseName));
+    }
+    const walkRoots = [path.join(home, "git")];
+    const skipDirs = /* @__PURE__ */ new Set(["node_modules", ".git", ".venv", "venv", "dist", "build", ".cache", "_alpha_cache"]);
+    let visited = 0;
+    const maxVisited = 2500;
+    const walk = (dir, depth) => {
+      if (depth > 4 || visited >= maxVisited) return;
+      let entries;
+      try {
+        entries = fs.readdirSync(dir, { withFileTypes: true });
+      } catch {
+        return;
+      }
+      for (const ent of entries) {
+        visited++;
+        if (visited >= maxVisited) return;
+        const full = path.join(dir, ent.name);
+        if (ent.isFile() && ent.name.toLowerCase() === baseName.toLowerCase()) {
+          consider(full);
+        } else if (ent.isDirectory() && !ent.name.startsWith(".") && !skipDirs.has(ent.name)) {
+          walk(full, depth + 1);
+        }
+      }
+    };
+    for (const root of walkRoots) {
+      if (fs.existsSync(root)) walk(root, 0);
+    }
+  }
+  if (matches.length === 0) return null;
+  matches.sort((a, b) => b.mtimeMs - a.mtimeMs);
+  return matches[0].absPath;
 }
 function registerPdfList(items, defaultPage) {
   const metas = [];
   for (let i = 0; i < Math.min(items.length, 5); i++) {
     const item = items[i];
-    const absPath = path.resolve(item.path);
-    if (!fs.existsSync(absPath)) {
-      throw new Error(`PDF file not found: ${absPath}`);
-    }
-    const stat = fs.statSync(absPath);
-    if (!stat.isFile()) {
-      throw new Error(`Path is not a file: ${absPath}`);
-    }
-    const ext = path.extname(absPath).toLowerCase();
-    if (ext !== ".pdf") {
-      throw new Error(`Unsupported file type "${ext}" for ${path.basename(absPath)}. Expected .pdf`);
-    }
-    const id = makePdfId(absPath);
-    const fileName = path.basename(absPath);
-    const label = item.label && item.label.trim() || fileName.replace(/\.pdf$/i, "");
-    const initialPage = Math.max(1, Math.floor(item.page ?? defaultPage ?? 1));
-    const meta = {
-      id,
-      label,
-      fileName,
-      sizeBytes: stat.size,
-      mtimeMs: stat.mtimeMs,
-      initialPage
-    };
-    registeredPdfs.set(id, { id, absPath, meta });
+    const meta = registerSingleDiskPdf(item.path, item.label, item.page ?? defaultPage ?? 1);
     metas.push(meta);
+  }
+  if (metas.length > 0) {
+    saveRegistry();
   }
   return metas;
 }
@@ -21704,6 +21881,162 @@ function readAppHtml() {
     throw new Error(`PDF Viewer HTML bundle missing at ${htmlPath}. Run npm run build.`);
   }
   return fs.readFileSync(htmlPath, "utf8");
+}
+function tokensEqual(a, b) {
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  if (bufA.length !== bufB.length) return false;
+  return crypto.timingSafeEqual(bufA, bufB);
+}
+async function startLocalRangeServer() {
+  return new Promise((resolve) => {
+    const httpServer = http.createServer((req, res) => {
+      const corsHeaders = {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, HEAD, OPTIONS",
+        "Access-Control-Allow-Headers": "Range, Content-Type",
+        "Access-Control-Expose-Headers": "Accept-Ranges, Content-Encoding, Content-Length, Content-Range",
+        "Cross-Origin-Resource-Policy": "cross-origin",
+        "Cache-Control": "no-store"
+      };
+      if (req.method === "OPTIONS") {
+        res.writeHead(204, corsHeaders);
+        res.end();
+        return;
+      }
+      if (req.method !== "GET" && req.method !== "HEAD") {
+        res.writeHead(405, corsHeaders);
+        res.end("Method Not Allowed");
+        return;
+      }
+      let pathname = "";
+      try {
+        pathname = new URL(req.url || "/", "http://127.0.0.1").pathname;
+      } catch {
+        res.writeHead(400, corsHeaders);
+        res.end("Bad Request");
+        return;
+      }
+      const match = /^\/pdf\/([a-f0-9]+)\/([a-f0-9]+)$/.exec(pathname);
+      if (!match || !tokensEqual(match[1], STREAM_TOKEN)) {
+        res.writeHead(403, corsHeaders);
+        res.end("Forbidden");
+        return;
+      }
+      const pdfId = match[2];
+      const reg = registeredPdfs.get(pdfId);
+      if (!reg || !fs.existsSync(reg.absPath)) {
+        res.writeHead(404, corsHeaders);
+        res.end("Not Found");
+        return;
+      }
+      let stat;
+      try {
+        stat = fs.statSync(reg.absPath);
+        if (!stat.isFile()) {
+          res.writeHead(404, corsHeaders);
+          res.end("Not Found");
+          return;
+        }
+      } catch {
+        res.writeHead(404, corsHeaders);
+        res.end("Not Found");
+        return;
+      }
+      const totalSize = stat.size;
+      const rangeHeader = req.headers.range;
+      if (rangeHeader) {
+        const rangeMatch = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader.trim());
+        if (!rangeMatch) {
+          res.writeHead(416, {
+            ...corsHeaders,
+            "Content-Range": `bytes */${totalSize}`
+          });
+          res.end();
+          return;
+        }
+        let start;
+        let end;
+        if (rangeMatch[1] === "" && rangeMatch[2] !== "") {
+          const suffixLen = parseInt(rangeMatch[2], 10);
+          if (Number.isNaN(suffixLen) || suffixLen <= 0) {
+            res.writeHead(416, { ...corsHeaders, "Content-Range": `bytes */${totalSize}` });
+            res.end();
+            return;
+          }
+          start = Math.max(0, totalSize - suffixLen);
+          end = totalSize - 1;
+        } else {
+          start = parseInt(rangeMatch[1], 10);
+          end = rangeMatch[2] ? parseInt(rangeMatch[2], 10) : totalSize - 1;
+          if (Number.isNaN(start) || Number.isNaN(end) || start < 0 || start >= totalSize || end < start) {
+            res.writeHead(416, { ...corsHeaders, "Content-Range": `bytes */${totalSize}` });
+            res.end();
+            return;
+          }
+          end = Math.min(end, totalSize - 1);
+        }
+        const chunkLen = end - start + 1;
+        res.writeHead(206, {
+          ...corsHeaders,
+          "Content-Type": "application/pdf",
+          "Accept-Ranges": "bytes",
+          "Content-Range": `bytes ${start}-${end}/${totalSize}`,
+          "Content-Length": String(chunkLen)
+        });
+        if (req.method === "HEAD") {
+          res.end();
+          return;
+        }
+        const stream2 = fs.createReadStream(reg.absPath, { start, end });
+        const cleanup2 = () => {
+          if (!stream2.destroyed) stream2.destroy();
+        };
+        req.on("close", cleanup2);
+        res.on("close", cleanup2);
+        stream2.on("error", () => {
+          if (!res.headersSent) res.writeHead(500, corsHeaders);
+          res.end();
+        });
+        stream2.pipe(res);
+        return;
+      }
+      res.writeHead(200, {
+        ...corsHeaders,
+        "Content-Type": "application/pdf",
+        "Accept-Ranges": "bytes",
+        "Content-Length": String(totalSize)
+      });
+      if (req.method === "HEAD") {
+        res.end();
+        return;
+      }
+      const stream = fs.createReadStream(reg.absPath);
+      const cleanup = () => {
+        if (!stream.destroyed) stream.destroy();
+      };
+      req.on("close", cleanup);
+      res.on("close", cleanup);
+      stream.on("error", () => {
+        if (!res.headersSent) res.writeHead(500, corsHeaders);
+        res.end();
+      });
+      stream.pipe(res);
+    });
+    httpServer.on("error", (err) => {
+      appendDebugLog("range_server_error", { message: err.message });
+      resolve(null);
+    });
+    httpServer.listen(0, "127.0.0.1", () => {
+      const addr = httpServer.address();
+      if (addr && typeof addr === "object") {
+        httpServer.unref();
+        resolve(`http://127.0.0.1:${addr.port}`);
+      } else {
+        resolve(null);
+      }
+    });
+  });
 }
 var PdfFileInputSchema = external_exports.object({
   path: external_exports.string().describe("Absolute path to a .pdf file"),
@@ -21785,436 +22118,555 @@ function buildSessionResult(layout, args) {
     structuredContent: payload
   };
 }
-var server = new McpServer(
-  {
-    name: "pdf-viewer",
-    version: "1.1.0"
-  },
-  {
-    capabilities: {
-      resources: {},
-      tools: {}
-    }
-  }
-);
-server.registerResource(
-  "Inline PDF Viewer App",
-  APP_URI,
-  {
-    description: "Interactive PDF.js viewer with search, thumbnails, outline, zoom, and 2-page spread mode",
-    mimeType: "text/html;profile=mcp-app",
-    _meta: {
-      ui: {
-        prefersBorder: true
-      }
-    }
-  },
-  async () => ({
-    contents: [
-      {
-        uri: APP_URI,
-        mimeType: "text/html;profile=mcp-app",
-        text: readAppHtml()
-      }
-    ]
-  })
-);
-server.registerTool(
-  "view_pdf_inline",
-  {
-    title: "Inline PDF Viewer",
-    description: "Render 1 to 5 local PDF files inline right inside the chat conversation with full page navigation, zoom, search, text selection, outline, thumbnails, and 2-page book spread mode.",
-    inputSchema: SharedViewerArgs,
-    _meta: {
-      ui: {
-        resourceUri: APP_URI
-      }
-    }
-  },
-  async (args) => {
-    const normalized = normalizeFileArgs(args);
-    if (normalized.length === 0) {
-      return {
-        isError: true,
-        content: [
-          {
-            type: "text",
-            text: 'Provide either "path" (absolute path to a .pdf) or "files" (1-5 PDF entries) to view inline.'
-          }
-        ]
-      };
-    }
-    try {
-      return buildSessionResult("inline", args);
-    } catch (err) {
-      return {
-        isError: true,
-        content: [{ type: "text", text: err instanceof Error ? err.message : String(err) }]
-      };
-    }
-  }
-);
-server.registerTool(
-  "open_pdf_viewer",
-  {
-    title: "PDF Viewer",
-    description: "Open or update 1 to 5 local PDF files in the full-height PDF Viewer side panel. Calling with no arguments reopens the last viewed PDF or shows a drop zone.",
-    inputSchema: SharedViewerArgs,
-    _meta: {
-      ui: {
-        resourceUri: APP_URI
-      },
-      "com.google.antigravity/ui": {
-        entrypoints: [{ type: "aux_pane", title: "PDF Viewer" }]
-      }
-    }
-  },
-  async (args) => {
-    try {
-      return buildSessionResult("pane", args);
-    } catch (err) {
-      return {
-        isError: true,
-        content: [{ type: "text", text: err instanceof Error ? err.message : String(err) }]
-      };
-    }
-  }
-);
-server.registerTool(
-  "view_pdf_file",
-  {
-    title: "PDF Viewer",
-    description: "Host-invoked custom file viewer for .pdf files.",
-    inputSchema: {
-      file: external_exports.object({
-        name: external_exports.string(),
-        resourceUri: external_exports.string().optional(),
-        uri: external_exports.string().optional(),
-        path: external_exports.string().optional()
-      }).passthrough().optional()
+async function main() {
+  streamOrigin = await startLocalRangeServer();
+  loadRegistry();
+  appendDebugLog("startup", {
+    streamOrigin,
+    dataDir: DATA_DIR,
+    registeredCount: registeredPdfs.size
+  });
+  const server = new McpServer(
+    {
+      name: "pdf-viewer",
+      version: "1.2.0"
     },
-    _meta: {
-      ui: {
-        resourceUri: APP_URI,
-        visibility: ["app"]
-      },
-      "com.google.antigravity/ui": {
-        entrypoints: [
-          {
-            type: "file",
-            title: "PDF Viewer",
-            extensions: [".pdf"]
-          }
-        ]
+    {
+      capabilities: {
+        resources: {},
+        tools: {}
       }
     }
-  },
-  async ({ file }) => {
-    if (file && pendingPromotedSession && Date.now() - pendingPromotedSession.createdAt <= PROMOTED_SESSION_TTL_MS && pendingPromotedSession.activeFileName.toLowerCase() === file.name.toLowerCase()) {
-      const promoted = pendingPromotedSession.payload;
-      pendingPromotedSession = null;
-      return {
-        content: [{ type: "text", text: `Opened promoted PDF Viewer session for ${file.name}.` }],
-        structuredContent: promoted
-      };
-    }
-    if (!file) {
-      return buildSessionResult("pane", {});
-    }
-    const directLocalPath = tryResolveLocalPdfPath(file);
-    if (directLocalPath) {
-      return buildSessionResult("pane", { path: directLocalPath });
-    }
-    for (const reg of registeredPdfs.values()) {
-      if (reg.meta.fileName.toLowerCase() === file.name.toLowerCase() && fs.existsSync(reg.absPath)) {
-        const stat = fs.statSync(reg.absPath);
-        const updatedMeta = {
-          ...reg.meta,
-          sizeBytes: stat.size,
-          mtimeMs: stat.mtimeMs
+  );
+  const resourceUiMeta = {
+    prefersBorder: true,
+    ...streamOrigin ? {
+      csp: {
+        resourceDomains: [streamOrigin],
+        connectDomains: [streamOrigin]
+      }
+    } : {}
+  };
+  server.registerResource(
+    "Inline PDF Viewer App",
+    APP_URI,
+    {
+      description: "Interactive PDF.js viewer with loopback HTTP range streaming, search, thumbnails, outline, zoom, and 2-page spread mode",
+      mimeType: "text/html;profile=mcp-app",
+      _meta: {
+        ui: resourceUiMeta
+      }
+    },
+    async () => ({
+      contents: [
+        {
+          uri: APP_URI,
+          mimeType: "text/html;profile=mcp-app",
+          text: readAppHtml(),
+          _meta: {
+            ui: resourceUiMeta
+          }
+        }
+      ]
+    })
+  );
+  server.registerTool(
+    "view_pdf_inline",
+    {
+      title: "Inline PDF Viewer",
+      description: "Render 1 to 5 local PDF files inline right inside the chat conversation with full page navigation, zoom, search, text selection, outline, thumbnails, and 2-page book spread mode.",
+      inputSchema: SharedViewerArgs,
+      _meta: {
+        ui: {
+          resourceUri: APP_URI
+        }
+      }
+    },
+    async (args) => {
+      const normalized = normalizeFileArgs(args);
+      if (normalized.length === 0) {
+        return {
+          isError: true,
+          content: [
+            {
+              type: "text",
+              text: 'Provide either "path" (absolute path to a .pdf) or "files" (1-5 PDF entries) to view inline.'
+            }
+          ]
         };
-        reg.meta = updatedMeta;
+      }
+      try {
+        return buildSessionResult("inline", args);
+      } catch (err) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: err instanceof Error ? err.message : String(err) }]
+        };
+      }
+    }
+  );
+  server.registerTool(
+    "open_pdf_viewer",
+    {
+      title: "PDF Viewer",
+      description: "Open or update 1 to 5 local PDF files in the full-height PDF Viewer side panel. Calling with no arguments reopens the last viewed PDF or shows a drop zone.",
+      inputSchema: SharedViewerArgs,
+      _meta: {
+        ui: {
+          resourceUri: APP_URI
+        },
+        "com.google.antigravity/ui": {
+          entrypoints: [{ type: "aux_pane", title: "PDF Viewer" }]
+        }
+      }
+    },
+    async (args) => {
+      try {
+        return buildSessionResult("pane", args);
+      } catch (err) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: err instanceof Error ? err.message : String(err) }]
+        };
+      }
+    }
+  );
+  server.registerTool(
+    "view_pdf_file",
+    {
+      title: "PDF Viewer",
+      description: "Host-invoked custom file viewer for .pdf files.",
+      inputSchema: {
+        file: external_exports.object({
+          name: external_exports.string(),
+          resourceUri: external_exports.string().optional(),
+          uri: external_exports.string().optional(),
+          path: external_exports.string().optional()
+        }).passthrough().optional()
+      },
+      _meta: {
+        ui: {
+          resourceUri: APP_URI,
+          visibility: ["app"]
+        },
+        "com.google.antigravity/ui": {
+          entrypoints: [
+            {
+              type: "file",
+              title: "PDF Viewer",
+              extensions: [".pdf"]
+            }
+          ]
+        }
+      }
+    },
+    async ({ file }) => {
+      appendDebugLog("view_pdf_file", { file });
+      if (file && pendingPromotedSession && Date.now() - pendingPromotedSession.createdAt <= PROMOTED_SESSION_TTL_MS && pendingPromotedSession.activeFileName.toLowerCase() === file.name.toLowerCase()) {
+        const promoted = pendingPromotedSession.payload;
+        pendingPromotedSession = null;
+        return {
+          content: [{ type: "text", text: `Opened promoted PDF Viewer session for ${file.name}.` }],
+          structuredContent: promoted
+        };
+      }
+      if (!file) {
+        return buildSessionResult("pane", {});
+      }
+      const directLocalPath = tryResolveLocalPdfPath(file);
+      if (directLocalPath) {
+        appendDebugLog("view_pdf_file_resolved_direct", { directLocalPath });
+        return buildSessionResult("pane", { path: directLocalPath });
+      }
+      const reg = findRegisteredByFileName(file.name);
+      if (reg && fs.existsSync(reg.absPath)) {
+        const meta = registerSingleDiskPdf(reg.absPath, reg.meta.label, 1);
+        saveRegistry();
+        appendDebugLog("view_pdf_file_resolved_registry", { absPath: reg.absPath, sizeBytes: meta.sizeBytes });
         const sessionPayload = {
           kind: "session",
           sessionId: crypto.randomUUID(),
           layout: "pane",
-          title: updatedMeta.label,
+          title: meta.label,
           activeIndex: 0,
           viewMode: "single",
           zoomMode: "fit-page",
           inlineHeight: 640,
-          pdfs: [updatedMeta]
+          pdfs: [meta]
         };
         return {
           content: [{ type: "text", text: `Opened ${file.name} in PDF Viewer.` }],
           structuredContent: sessionPayload
         };
       }
-    }
-    const effectiveUri = file.resourceUri || file.uri || "";
-    const payload = {
-      kind: "file_viewer",
-      layout: "pane",
-      file: {
-        name: file.name,
-        resourceUri: effectiveUri
-      }
-    };
-    return {
-      content: [{ type: "text", text: `Opened ${file.name} in PDF Viewer.` }],
-      structuredContent: payload
-    };
-  }
-);
-server.registerTool(
-  "promote_pdf_to_pane",
-  {
-    title: "Promote Inline PDF to Side Panel",
-    description: "App-only tool that registers current inline viewer state for instant side-panel opening.",
-    inputSchema: {
-      pdfIds: external_exports.array(external_exports.string()).min(1).max(5),
-      activeIndex: external_exports.number().int().min(0).max(4).default(0),
-      currentPage: external_exports.number().int().min(1).default(1),
-      title: external_exports.string().optional(),
-      viewMode: external_exports.enum(["single", "spread", "scroll"]).default("single"),
-      zoomMode: external_exports.enum(["fit-page", "fit-width", "actual"]).default("fit-page")
-    },
-    _meta: {
-      ui: {
-        visibility: ["app"]
-      }
-    }
-  },
-  async ({ pdfIds, activeIndex, currentPage, title, viewMode, zoomMode }) => {
-    const regs = [];
-    for (const id of pdfIds) {
-      const reg = registeredPdfs.get(id);
-      if (reg && fs.existsSync(reg.absPath)) regs.push(reg);
-    }
-    if (regs.length === 0) {
-      return {
-        isError: true,
-        content: [{ type: "text", text: "No registered PDFs found for promotion." }]
-      };
-    }
-    const clampedActive = Math.min(Math.max(0, activeIndex), regs.length - 1);
-    const activeReg = regs[clampedActive];
-    const fileUri = pathToFileURL(activeReg.absPath).href;
-    const promotedMetas = regs.map((r, idx) => ({
-      ...r.meta,
-      initialPage: idx === clampedActive ? currentPage : r.meta.initialPage
-    }));
-    const promotedPayload = {
-      kind: "session",
-      sessionId: crypto.randomUUID(),
-      layout: "pane",
-      title: title || (regs.length === 1 ? activeReg.meta.label : "PDF Viewer"),
-      activeIndex: clampedActive,
-      viewMode,
-      zoomMode,
-      inlineHeight: 640,
-      pdfs: promotedMetas
-    };
-    pendingPromotedSession = {
-      createdAt: Date.now(),
-      activeFileName: activeReg.meta.fileName,
-      payload: promotedPayload
-    };
-    const resp = {
-      fileUri,
-      fileName: activeReg.meta.fileName
-    };
-    return {
-      content: [{ type: "text", text: `Prepared side panel view for ${activeReg.meta.fileName}` }],
-      structuredContent: resp
-    };
-  }
-);
-server.registerTool(
-  "load_pdf_chunk",
-  {
-    title: "Load PDF Chunk",
-    description: "App-only tool that streams a registered PDF file in <=512 KiB base64 chunks by chunkIndex or explicit byte offset/length.",
-    inputSchema: {
-      pdfId: external_exports.string().describe("Registered PDF ID from the session payload"),
-      chunkIndex: external_exports.number().int().min(0).default(0),
-      offset: external_exports.number().int().min(0).optional().describe("Optional explicit byte offset for range streaming"),
-      length: external_exports.number().int().min(1).max(CHUNK_SIZE_BYTES).optional().describe("Optional explicit byte length (max 512 KiB) for range streaming")
-    },
-    _meta: {
-      ui: {
-        visibility: ["app"]
-      }
-    }
-  },
-  async ({ pdfId, chunkIndex, offset, length }) => {
-    const reg = registeredPdfs.get(pdfId);
-    if (!reg) {
-      return {
-        isError: true,
-        content: [{ type: "text", text: `Unknown pdfId: ${pdfId}` }]
-      };
-    }
-    if (!fs.existsSync(reg.absPath)) {
-      return {
-        isError: true,
-        content: [{ type: "text", text: `PDF file no longer exists on disk: ${reg.absPath}` }]
-      };
-    }
-    const stat = fs.statSync(reg.absPath);
-    const totalBytes = stat.size;
-    const totalChunks = Math.max(1, Math.ceil(totalBytes / CHUNK_SIZE_BYTES));
-    let start;
-    let sliceLen;
-    let clampedIdx;
-    if (typeof offset === "number") {
-      start = Math.min(Math.max(0, offset), totalBytes);
-      const reqLen = Math.min(CHUNK_SIZE_BYTES, Math.max(1, length ?? CHUNK_SIZE_BYTES));
-      sliceLen = Math.max(0, Math.min(reqLen, totalBytes - start));
-      clampedIdx = Math.floor(start / CHUNK_SIZE_BYTES);
-    } else {
-      clampedIdx = Math.min(Math.max(0, chunkIndex), totalChunks - 1);
-      start = clampedIdx * CHUNK_SIZE_BYTES;
-      sliceLen = Math.max(0, Math.min(CHUNK_SIZE_BYTES, totalBytes - start));
-    }
-    const buf = Buffer.allocUnsafe(sliceLen);
-    if (sliceLen > 0) {
-      const fd = fs.openSync(reg.absPath, "r");
-      try {
-        fs.readSync(fd, buf, 0, sliceLen, start);
-      } finally {
-        fs.closeSync(fd);
-      }
-    }
-    reg.meta.sizeBytes = totalBytes;
-    reg.meta.mtimeMs = stat.mtimeMs;
-    const resp = {
-      pdfId,
-      fileName: reg.meta.fileName,
-      totalBytes,
-      mtimeMs: stat.mtimeMs,
-      offset: start,
-      length: sliceLen,
-      chunkIndex: clampedIdx,
-      totalChunks,
-      dataBase64: buf.toString("base64")
-    };
-    return {
-      content: [
-        {
-          type: "text",
-          text: `Bytes ${start}-${start + sliceLen} of ${totalBytes} (${sliceLen} bytes)`
+      const effectiveUri = file.resourceUri || file.uri || "";
+      const payload = {
+        kind: "file_viewer",
+        layout: "pane",
+        file: {
+          name: file.name,
+          resourceUri: effectiveUri
         }
-      ],
-      structuredContent: resp
-    };
-  }
-);
-server.registerTool(
-  "save_pdf_locally",
-  {
-    title: "Save PDF Locally",
-    description: "App-only tool that saves a local copy of a registered PDF into ~/Downloads without overwriting existing files.",
-    inputSchema: {
-      pdfId: external_exports.string().describe("Registered PDF ID from the session payload"),
-      fileName: external_exports.string().optional().describe("Optional preferred filename")
+      };
+      return {
+        content: [{ type: "text", text: `Opened ${file.name} in PDF Viewer.` }],
+        structuredContent: payload
+      };
+    }
+  );
+  server.registerTool(
+    "get_pdf_source",
+    {
+      title: "Resolve PDF Source",
+      description: "App-only tool that refreshes disk metadata and returns the live local range-stream URL for a registered PDF.",
+      inputSchema: {
+        pdfId: external_exports.string(),
+        fileName: external_exports.string().optional()
+      },
+      _meta: {
+        ui: {
+          visibility: ["app"]
+        }
+      }
     },
-    _meta: {
-      ui: {
-        visibility: ["app"]
+    async ({ pdfId, fileName }) => {
+      let reg = registeredPdfs.get(pdfId);
+      if ((!reg || !fs.existsSync(reg.absPath)) && fileName) {
+        const byName = findRegisteredByFileName(fileName);
+        if (byName) {
+          reg = byName;
+        } else {
+          const onDisk = findPdfOnDiskByName(fileName);
+          if (onDisk) {
+            const meta = registerSingleDiskPdf(onDisk);
+            saveRegistry();
+            reg = registeredPdfs.get(meta.id);
+          }
+        }
       }
-    }
-  },
-  async ({ pdfId, fileName }) => {
-    const reg = registeredPdfs.get(pdfId);
-    if (!reg) {
-      return {
-        isError: true,
-        content: [{ type: "text", text: `Unknown pdfId: ${pdfId}` }]
-      };
-    }
-    if (!fs.existsSync(reg.absPath)) {
-      return {
-        isError: true,
-        content: [{ type: "text", text: `PDF file not found on disk: ${reg.absPath}` }]
-      };
-    }
-    try {
-      const targetPath = pickNonClobberingDownloadsPath(fileName || reg.meta.fileName);
-      fs.copyFileSync(reg.absPath, targetPath);
-      const stat = fs.statSync(targetPath);
-      const resp = {
-        savedPath: targetPath,
-        fileName: path.basename(targetPath),
-        sizeBytes: stat.size
-      };
-      return {
-        content: [{ type: "text", text: `Saved PDF copy to ${targetPath}` }],
-        structuredContent: resp
-      };
-    } catch (err) {
-      return {
-        isError: true,
-        content: [{ type: "text", text: `Save failed: ${err instanceof Error ? err.message : String(err)}` }]
-      };
-    }
-  }
-);
-server.registerTool(
-  "save_pdf_chunk",
-  {
-    title: "Save PDF Chunk Locally",
-    description: "App-only tool that receives base64 chunks of an in-memory PDF and writes a copy to ~/Downloads.",
-    inputSchema: {
-      uploadId: external_exports.string(),
-      fileName: external_exports.string(),
-      chunkIndex: external_exports.number().int().min(0),
-      totalChunks: external_exports.number().int().min(1),
-      dataBase64: external_exports.string()
-    },
-    _meta: {
-      ui: {
-        visibility: ["app"]
-      }
-    }
-  },
-  async ({ uploadId, fileName, chunkIndex, totalChunks, dataBase64 }) => {
-    try {
-      let chunks = pendingSaveUploads.get(uploadId);
-      if (!chunks || chunkIndex === 0) {
-        chunks = new Array(totalChunks);
-        pendingSaveUploads.set(uploadId, chunks);
-      }
-      chunks[chunkIndex] = Buffer.from(dataBase64, "base64");
-      if (chunkIndex < totalChunks - 1) {
+      if (!reg) {
         return {
-          content: [{ type: "text", text: `Received chunk ${chunkIndex + 1}/${totalChunks}` }],
-          structuredContent: { received: chunkIndex + 1, totalChunks }
+          isError: true,
+          content: [{ type: "text", text: `Unknown pdfId: ${pdfId}` }]
         };
       }
-      pendingSaveUploads.delete(uploadId);
-      const fullBuf = Buffer.concat(chunks.filter(Boolean));
-      const targetPath = pickNonClobberingDownloadsPath(fileName);
-      fs.writeFileSync(targetPath, fullBuf);
+      if (!fs.existsSync(reg.absPath)) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: `PDF file no longer exists on disk: ${reg.absPath}` }]
+        };
+      }
+      const stat = fs.statSync(reg.absPath);
+      reg.meta.sizeBytes = stat.size;
+      reg.meta.mtimeMs = stat.mtimeMs;
+      reg.meta.streamUrl = buildStreamUrl(reg.id, stat.mtimeMs);
       const resp = {
-        savedPath: targetPath,
-        fileName: path.basename(targetPath),
-        sizeBytes: fullBuf.length
+        pdfId: reg.id,
+        label: reg.meta.label,
+        fileName: reg.meta.fileName,
+        sizeBytes: stat.size,
+        mtimeMs: stat.mtimeMs,
+        streamUrl: reg.meta.streamUrl
       };
       return {
-        content: [{ type: "text", text: `Saved PDF copy to ${targetPath}` }],
+        content: [{ type: "text", text: `Resolved ${reg.meta.fileName} (${formatBytes(stat.size)})` }],
         structuredContent: resp
       };
-    } catch (err) {
-      pendingSaveUploads.delete(uploadId);
+    }
+  );
+  server.registerTool(
+    "resolve_pdf_by_name",
+    {
+      title: "Resolve Clicked PDF by Name",
+      description: "App-only fallback that locates a clicked .pdf file on local disk when host resources/read exceeds size limits.",
+      inputSchema: {
+        fileName: external_exports.string()
+      },
+      _meta: {
+        ui: {
+          visibility: ["app"]
+        }
+      }
+    },
+    async ({ fileName }) => {
+      const foundPath = findPdfOnDiskByName(fileName);
+      appendDebugLog("resolve_pdf_by_name", { fileName, foundPath });
+      if (!foundPath) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: `Could not locate "${fileName}" on local disk.` }]
+        };
+      }
+      const meta = registerSingleDiskPdf(foundPath);
+      saveRegistry();
+      const resp = {
+        pdfId: meta.id,
+        label: meta.label,
+        fileName: meta.fileName,
+        sizeBytes: meta.sizeBytes,
+        mtimeMs: meta.mtimeMs,
+        streamUrl: meta.streamUrl
+      };
       return {
-        isError: true,
-        content: [{ type: "text", text: `Save failed: ${err instanceof Error ? err.message : String(err)}` }]
+        content: [{ type: "text", text: `Located ${meta.fileName} (${formatBytes(meta.sizeBytes)})` }],
+        structuredContent: resp
       };
     }
-  }
-);
-async function main() {
+  );
+  server.registerTool(
+    "promote_pdf_to_pane",
+    {
+      title: "Promote Inline PDF to Side Panel",
+      description: "App-only tool that registers current inline viewer state for instant side-panel opening.",
+      inputSchema: {
+        pdfIds: external_exports.array(external_exports.string()).min(1).max(5),
+        activeIndex: external_exports.number().int().min(0).max(4).default(0),
+        currentPage: external_exports.number().int().min(1).default(1),
+        title: external_exports.string().optional(),
+        viewMode: external_exports.enum(["single", "spread", "scroll"]).default("single"),
+        zoomMode: external_exports.enum(["fit-page", "fit-width", "actual"]).default("fit-page")
+      },
+      _meta: {
+        ui: {
+          visibility: ["app"]
+        }
+      }
+    },
+    async ({ pdfIds, activeIndex, currentPage, title, viewMode, zoomMode }) => {
+      const regs = [];
+      for (const id of pdfIds) {
+        const reg = registeredPdfs.get(id);
+        if (reg && fs.existsSync(reg.absPath)) regs.push(reg);
+      }
+      if (regs.length === 0) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: "No registered PDFs found for promotion." }]
+        };
+      }
+      const clampedActive = Math.min(Math.max(0, activeIndex), regs.length - 1);
+      const activeReg = regs[clampedActive];
+      const fileUri = pathToFileURL(activeReg.absPath).href;
+      const promotedMetas = regs.map((r, idx) => {
+        const stat = fs.statSync(r.absPath);
+        return {
+          ...r.meta,
+          sizeBytes: stat.size,
+          mtimeMs: stat.mtimeMs,
+          streamUrl: buildStreamUrl(r.id, stat.mtimeMs),
+          initialPage: idx === clampedActive ? currentPage : r.meta.initialPage
+        };
+      });
+      const promotedPayload = {
+        kind: "session",
+        sessionId: crypto.randomUUID(),
+        layout: "pane",
+        title: title || (regs.length === 1 ? activeReg.meta.label : "PDF Viewer"),
+        activeIndex: clampedActive,
+        viewMode,
+        zoomMode,
+        inlineHeight: 640,
+        pdfs: promotedMetas
+      };
+      pendingPromotedSession = {
+        createdAt: Date.now(),
+        activeFileName: activeReg.meta.fileName,
+        payload: promotedPayload
+      };
+      const resp = {
+        fileUri,
+        fileName: activeReg.meta.fileName
+      };
+      return {
+        content: [{ type: "text", text: `Prepared side panel view for ${activeReg.meta.fileName}` }],
+        structuredContent: resp
+      };
+    }
+  );
+  server.registerTool(
+    "load_pdf_chunk",
+    {
+      title: "Load PDF Chunk",
+      description: "App-only tool that streams a registered PDF file in <=512 KiB base64 chunks by chunkIndex or explicit byte offset/length.",
+      inputSchema: {
+        pdfId: external_exports.string().describe("Registered PDF ID from the session payload"),
+        chunkIndex: external_exports.number().int().min(0).default(0),
+        offset: external_exports.number().int().min(0).optional().describe("Optional explicit byte offset for range streaming"),
+        length: external_exports.number().int().min(1).max(CHUNK_SIZE_BYTES).optional().describe("Optional explicit byte length (max 512 KiB) for range streaming")
+      },
+      _meta: {
+        ui: {
+          visibility: ["app"]
+        }
+      }
+    },
+    async ({ pdfId, chunkIndex, offset, length }) => {
+      const reg = registeredPdfs.get(pdfId);
+      if (!reg) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: `Unknown pdfId: ${pdfId}` }]
+        };
+      }
+      if (!fs.existsSync(reg.absPath)) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: `PDF file no longer exists on disk: ${reg.absPath}` }]
+        };
+      }
+      const stat = fs.statSync(reg.absPath);
+      const totalBytes = stat.size;
+      const totalChunks = Math.max(1, Math.ceil(totalBytes / CHUNK_SIZE_BYTES));
+      let start;
+      let sliceLen;
+      let clampedIdx;
+      if (typeof offset === "number") {
+        start = Math.min(Math.max(0, offset), totalBytes);
+        const reqLen = Math.min(CHUNK_SIZE_BYTES, Math.max(1, length ?? CHUNK_SIZE_BYTES));
+        sliceLen = Math.max(0, Math.min(reqLen, totalBytes - start));
+        clampedIdx = Math.floor(start / CHUNK_SIZE_BYTES);
+      } else {
+        clampedIdx = Math.min(Math.max(0, chunkIndex), totalChunks - 1);
+        start = clampedIdx * CHUNK_SIZE_BYTES;
+        sliceLen = Math.max(0, Math.min(CHUNK_SIZE_BYTES, totalBytes - start));
+      }
+      const buf = Buffer.allocUnsafe(sliceLen);
+      if (sliceLen > 0) {
+        const fd = fs.openSync(reg.absPath, "r");
+        try {
+          fs.readSync(fd, buf, 0, sliceLen, start);
+        } finally {
+          fs.closeSync(fd);
+        }
+      }
+      reg.meta.sizeBytes = totalBytes;
+      reg.meta.mtimeMs = stat.mtimeMs;
+      const resp = {
+        pdfId,
+        fileName: reg.meta.fileName,
+        totalBytes,
+        mtimeMs: stat.mtimeMs,
+        offset: start,
+        length: sliceLen,
+        chunkIndex: clampedIdx,
+        totalChunks,
+        dataBase64: buf.toString("base64")
+      };
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Bytes ${start}-${start + sliceLen} of ${totalBytes} (${sliceLen} bytes)`
+          }
+        ],
+        structuredContent: resp
+      };
+    }
+  );
+  server.registerTool(
+    "save_pdf_locally",
+    {
+      title: "Save PDF Locally",
+      description: "App-only tool that saves a local copy of a registered PDF into ~/Downloads without overwriting existing files.",
+      inputSchema: {
+        pdfId: external_exports.string().describe("Registered PDF ID from the session payload"),
+        fileName: external_exports.string().optional().describe("Optional preferred filename")
+      },
+      _meta: {
+        ui: {
+          visibility: ["app"]
+        }
+      }
+    },
+    async ({ pdfId, fileName }) => {
+      const reg = registeredPdfs.get(pdfId);
+      if (!reg) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: `Unknown pdfId: ${pdfId}` }]
+        };
+      }
+      if (!fs.existsSync(reg.absPath)) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: `PDF file not found on disk: ${reg.absPath}` }]
+        };
+      }
+      try {
+        const targetPath = pickNonClobberingDownloadsPath(fileName || reg.meta.fileName);
+        fs.copyFileSync(reg.absPath, targetPath);
+        const stat = fs.statSync(targetPath);
+        const resp = {
+          savedPath: targetPath,
+          fileName: path.basename(targetPath),
+          sizeBytes: stat.size
+        };
+        return {
+          content: [{ type: "text", text: `Saved PDF copy to ${targetPath}` }],
+          structuredContent: resp
+        };
+      } catch (err) {
+        return {
+          isError: true,
+          content: [{ type: "text", text: `Save failed: ${err instanceof Error ? err.message : String(err)}` }]
+        };
+      }
+    }
+  );
+  server.registerTool(
+    "save_pdf_chunk",
+    {
+      title: "Save PDF Chunk Locally",
+      description: "App-only tool that receives base64 chunks of an in-memory PDF and writes a copy to ~/Downloads.",
+      inputSchema: {
+        uploadId: external_exports.string(),
+        fileName: external_exports.string(),
+        chunkIndex: external_exports.number().int().min(0),
+        totalChunks: external_exports.number().int().min(1),
+        dataBase64: external_exports.string()
+      },
+      _meta: {
+        ui: {
+          visibility: ["app"]
+        }
+      }
+    },
+    async ({ uploadId, fileName, chunkIndex, totalChunks, dataBase64 }) => {
+      try {
+        let chunks = pendingSaveUploads.get(uploadId);
+        if (!chunks || chunkIndex === 0) {
+          chunks = new Array(totalChunks);
+          pendingSaveUploads.set(uploadId, chunks);
+        }
+        chunks[chunkIndex] = Buffer.from(dataBase64, "base64");
+        if (chunkIndex < totalChunks - 1) {
+          return {
+            content: [{ type: "text", text: `Received chunk ${chunkIndex + 1}/${totalChunks}` }],
+            structuredContent: { received: chunkIndex + 1, totalChunks }
+          };
+        }
+        pendingSaveUploads.delete(uploadId);
+        const fullBuf = Buffer.concat(chunks.filter(Boolean));
+        const targetPath = pickNonClobberingDownloadsPath(fileName);
+        fs.writeFileSync(targetPath, fullBuf);
+        const resp = {
+          savedPath: targetPath,
+          fileName: path.basename(targetPath),
+          sizeBytes: fullBuf.length
+        };
+        return {
+          content: [{ type: "text", text: `Saved PDF copy to ${targetPath}` }],
+          structuredContent: resp
+        };
+      } catch (err) {
+        pendingSaveUploads.delete(uploadId);
+        return {
+          isError: true,
+          content: [{ type: "text", text: `Save failed: ${err instanceof Error ? err.message : String(err)}` }]
+        };
+      }
+    }
+  );
   const transport = new StdioServerTransport();
   await server.connect(transport);
 }

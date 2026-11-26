@@ -9,6 +9,7 @@ export interface PdfSlotMeta {
   sizeBytes: number;
   mtimeMs: number;
   initialPage: number;
+  streamUrl?: string;
 }
 
 export interface PdfSessionPayload {
@@ -33,6 +34,15 @@ export interface PdfFileViewerPayload {
 }
 
 export type ViewerPayload = PdfSessionPayload | PdfFileViewerPayload;
+
+export interface ResolvePdfSourceResponse {
+  pdfId: string;
+  label: string;
+  fileName: string;
+  sizeBytes: number;
+  mtimeMs: number;
+  streamUrl?: string;
+}
 
 export interface LoadPdfChunkResponse {
   pdfId: string;

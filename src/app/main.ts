@@ -12,6 +12,7 @@ import type {
   PdfSessionPayload,
   PdfSlotMeta,
   PromotePdfResponse,
+  ResolvePdfSourceResponse,
   SavePdfResponse,
   ViewMode,
   ViewerPayload,
@@ -856,12 +857,17 @@ class McpPdfRangeTransport extends pdfjsLib.PDFDataRangeTransport {
 }
 
 async function openPdfSource(
-  source: { kind: 'bytes'; bytes: Uint8Array } | { kind: 'range'; transport: McpPdfRangeTransport },
+  source:
+    | { kind: 'bytes'; bytes: Uint8Array }
+    | { kind: 'url'; url: string; totalBytes: number }
+    | { kind: 'range'; transport: McpPdfRangeTransport },
   displayName: string,
   sizeBytes: number,
   initialPage = 1,
+  options?: { rethrowOnFailure?: boolean; token?: number },
 ): Promise<void> {
-  const token = ++state.loadToken;
+  const token = options?.token ?? ++state.loadToken;
+  const rethrowOnFailure = Boolean(options?.rethrowOnFailure);
   cancelAllRenderTasks();
   disconnectObservers();
   pageTextCache.clear();
@@ -880,24 +886,40 @@ async function openPdfSource(
   docTitleEl.textContent = displayName;
   docTitleEl.title = displayName;
   docMetaEl.textContent = formatBytes(sizeBytes);
-  setLoading(`Rendering ${displayName}…`, 90, formatBytes(sizeBytes));
+  setLoading(`Rendering ${displayName}…`, 80, formatBytes(sizeBytes));
 
   try {
-    const loadingTask =
-      source.kind === 'bytes'
-        ? pdfjsLib.getDocument({
-            data: source.bytes.slice(),
-            isEvalSupported: false,
-            useWorkerFetch: false,
-          })
-        : pdfjsLib.getDocument({
-            range: source.transport,
-            rangeChunkSize: 262_144,
-            disableAutoFetch: true,
-            disableStream: true,
-            isEvalSupported: false,
-            useWorkerFetch: false,
-          });
+    let loadingTask: pdfjsLib.PDFDocumentLoadingTask;
+    if (source.kind === 'bytes') {
+      loadingTask = pdfjsLib.getDocument({
+        data: source.bytes.slice(),
+        isEvalSupported: false,
+        useWorkerFetch: false,
+        useSystemFonts: true,
+      });
+    } else if (source.kind === 'url') {
+      const large = source.totalBytes > RANGE_STREAM_THRESHOLD_BYTES;
+      loadingTask = pdfjsLib.getDocument({
+        url: source.url,
+        rangeChunkSize: 65_536,
+        disableAutoFetch: large,
+        disableStream: large,
+        isEvalSupported: false,
+        useWorkerFetch: false,
+        useSystemFonts: true,
+      });
+    } else {
+      loadingTask = pdfjsLib.getDocument({
+        range: source.transport,
+        rangeChunkSize: 65_536,
+        disableAutoFetch: true,
+        disableStream: true,
+        isEvalSupported: false,
+        useWorkerFetch: false,
+        useSystemFonts: true,
+      });
+    }
+
     const doc = await loadingTask.promise;
     if (token !== state.loadToken) {
       void doc.destroy();
@@ -917,6 +939,7 @@ async function openPdfSource(
     }
   } catch (err) {
     if (token !== state.loadToken) return;
+    if (rethrowOnFailure) throw err;
     const msg = err instanceof Error ? err.message : String(err);
     showError(msg);
   }
@@ -928,7 +951,35 @@ async function openPdfBytes(bytes: Uint8Array, displayName: string, sizeBytes: n
 }
 
 // MCP App bridge
-const app = new App({ name: 'Inline PDF Viewer', version: '1.1.0' }, {});
+const app = new App({ name: 'Inline PDF Viewer', version: '1.2.0' }, {});
+
+async function resolveLivePdfSource(pdfId: string, fileName?: string): Promise<ResolvePdfSourceResponse | null> {
+  try {
+    const res = await app.callServerTool({
+      name: 'get_pdf_source',
+      arguments: { pdfId, ...(fileName ? { fileName } : {}) },
+    });
+    if (res.isError) return null;
+    const structured = res.structuredContent as unknown as ResolvePdfSourceResponse | undefined;
+    return structured && typeof structured.pdfId === 'string' ? structured : null;
+  } catch {
+    return null;
+  }
+}
+
+async function resolvePdfByNameOnServer(fileName: string): Promise<ResolvePdfSourceResponse | null> {
+  try {
+    const res = await app.callServerTool({
+      name: 'resolve_pdf_by_name',
+      arguments: { fileName },
+    });
+    if (res.isError) return null;
+    const structured = res.structuredContent as unknown as ResolvePdfSourceResponse | undefined;
+    return structured && typeof structured.pdfId === 'string' ? structured : null;
+  } catch {
+    return null;
+  }
+}
 
 async function fetchPdfRange(pdfId: string, offset: number, length: number): Promise<LoadPdfChunkResponse> {
   const res = await app.callServerTool({
@@ -952,25 +1003,61 @@ async function fetchPdfRange(pdfId: string, offset: number, length: number): Pro
 
 async function loadRegisteredPdf(slot: PdfSlotMeta, forceReload = false): Promise<void> {
   const token = ++state.loadToken;
-  const cacheKey = `${slot.id}:${slot.mtimeMs}`;
 
   btnReload.classList.toggle('hidden', !mcpConnected);
   btnPopPane.classList.toggle('hidden', state.layout !== 'inline' || !mcpConnected || state.pdfs.length === 0);
-
-  if (!forceReload && bytesCache.has(cacheKey)) {
-    const cached = bytesCache.get(cacheKey)!;
-    await openPdfBytes(cached, slot.label || slot.fileName, cached.byteLength, slot.initialPage);
-    return;
-  }
 
   docTitleEl.textContent = slot.label || slot.fileName;
   docTitleEl.title = slot.fileName;
   docMetaEl.textContent = formatBytes(slot.sizeBytes);
   setLoading(`Opening ${slot.fileName}…`, 15, formatBytes(slot.sizeBytes));
 
+  // Refresh live metadata + current server loopback URL (handles restarts & rebuilt files on disk)
+  if (mcpConnected) {
+    const live = await resolveLivePdfSource(slot.id, slot.fileName);
+    if (token !== state.loadToken) return;
+    if (live) {
+      slot.id = live.pdfId;
+      slot.sizeBytes = live.sizeBytes;
+      slot.mtimeMs = live.mtimeMs;
+      slot.streamUrl = live.streamUrl;
+      docMetaEl.textContent = formatBytes(slot.sizeBytes);
+    }
+  }
+
+  const cacheKey = `${slot.id}:${slot.mtimeMs}`;
+  if (!forceReload && bytesCache.has(cacheKey)) {
+    const cached = bytesCache.get(cacheKey)!;
+    state.currentRawBytes = cached;
+    await openPdfSource({ kind: 'bytes', bytes: cached }, slot.label || slot.fileName, cached.byteLength, slot.initialPage, {
+      token,
+    });
+    return;
+  }
+
+  // Primary fast path: native PDF.js HTTP/1.1 Range streaming from local loopback server (<1s even for 500+ MB PDFs!)
+  if (slot.streamUrl) {
+    try {
+      state.currentRawBytes = null;
+      setLoading(`Streaming ${slot.fileName}…`, 50, formatBytes(slot.sizeBytes));
+      const urlWithBuster = forceReload ? `${slot.streamUrl}&r=${Date.now()}` : slot.streamUrl;
+      await openPdfSource(
+        { kind: 'url', url: urlWithBuster, totalBytes: slot.sizeBytes },
+        slot.label || slot.fileName,
+        slot.sizeBytes,
+        slot.initialPage,
+        { rethrowOnFailure: true, token },
+      );
+      return;
+    } catch {
+      if (token !== state.loadToken) return;
+      // Fall through cleanly to MCP chunk/range transport if loopback HTTP is blocked
+    }
+  }
+
   try {
-    // Probe first 256 KiB (also gets fresh totalBytes & mtimeMs from disk)
-    const first = await fetchPdfRange(slot.id, 0, 262_144);
+    // Fallback path: probe first 64 KiB over MCP tool calls
+    const first = await fetchPdfRange(slot.id, 0, 65_536);
     if (token !== state.loadToken) return;
 
     const totalBytes = first.totalBytes;
@@ -978,19 +1065,28 @@ async function loadRegisteredPdf(slot: PdfSlotMeta, forceReload = false): Promis
     slot.sizeBytes = totalBytes;
     slot.mtimeMs = first.mtimeMs;
 
-    // Large PDFs (> 4 MB): use on-demand HTTP-Range-style streaming so even 300+ MB print books open instantly!
+    // Large PDFs (> 4 MB): on-demand MCP byte-range streaming
     if (totalBytes > RANGE_STREAM_THRESHOLD_BYTES) {
       state.currentRawBytes = null;
       setLoading(`Streaming ${slot.fileName}…`, 60, `${formatBytes(totalBytes)} (on-demand)`);
       const transport = new McpPdfRangeTransport(slot.id, totalBytes, firstBytes);
-      await openPdfSource({ kind: 'range', transport }, slot.label || slot.fileName, totalBytes, slot.initialPage);
+      await openPdfSource({ kind: 'range', transport }, slot.label || slot.fileName, totalBytes, slot.initialPage, {
+        token,
+      });
       return;
     }
 
     // Small/medium PDFs (<= 4 MB): fetch remaining bytes upfront and cache for instant search & tab switching
     if (firstBytes.byteLength >= totalBytes) {
       bytesCache.set(`${slot.id}:${first.mtimeMs}`, firstBytes);
-      await openPdfBytes(firstBytes, slot.label || slot.fileName, firstBytes.byteLength, slot.initialPage);
+      state.currentRawBytes = firstBytes;
+      await openPdfSource(
+        { kind: 'bytes', bytes: firstBytes },
+        slot.label || slot.fileName,
+        firstBytes.byteLength,
+        slot.initialPage,
+        { token },
+      );
       return;
     }
 
@@ -998,7 +1094,6 @@ async function loadRegisteredPdf(slot: PdfSlotMeta, forceReload = false): Promis
     const parts = new Array<Uint8Array>(totalChunks + 1);
     parts[0] = firstBytes;
 
-    let completed = 0;
     let loadedBytes = firstBytes.byteLength;
     const concurrency = 3;
     let nextIdx = 0;
@@ -1012,7 +1107,6 @@ async function loadRegisteredPdf(slot: PdfSlotMeta, forceReload = false): Promis
         if (token !== state.loadToken) return;
         const bytes = base64ToUint8Array(chunk.dataBase64);
         parts[idx + 1] = bytes;
-        completed++;
         loadedBytes += bytes.byteLength;
         setLoading(
           `Loading ${slot.fileName}…`,
@@ -1034,7 +1128,10 @@ async function loadRegisteredPdf(slot: PdfSlotMeta, forceReload = false): Promis
     }
 
     bytesCache.set(`${slot.id}:${first.mtimeMs}`, full);
-    await openPdfBytes(full, slot.label || slot.fileName, full.byteLength, slot.initialPage);
+    state.currentRawBytes = full;
+    await openPdfSource({ kind: 'bytes', bytes: full }, slot.label || slot.fileName, full.byteLength, slot.initialPage, {
+      token,
+    });
   } catch (err) {
     if (token !== state.loadToken) return;
     const msg = err instanceof Error ? err.message : String(err);
@@ -1124,6 +1221,9 @@ async function applyFileViewerPayload(payload: PdfFileViewerPayload): Promise<vo
 
   setLoading(`Reading ${payload.file.name}…`, 25);
   try {
+    if (!payload.file.resourceUri) {
+      throw new Error('Missing resource URI from host');
+    }
     const res = await app.request(
       {
         method: 'resources/read',
@@ -1148,8 +1248,30 @@ async function applyFileViewerPayload(payload: PdfFileViewerPayload): Promise<vo
     }
     const bytes = base64ToUint8Array(first.blob);
     await openPdfBytes(bytes, payload.file.name, bytes.byteLength, 1);
-  } catch (err) {
-    showError(err instanceof Error ? err.message : String(err));
+  } catch (readErr) {
+    // Fallback for >10 MiB PDFs clicked cold via opaque antigravity-file:// URIs:
+    // ask our local MCP server to locate the PDF on disk and stream it via loopback HTTP!
+    if (mcpConnected && payload.file.name) {
+      setLoading(`Locating ${payload.file.name} on disk…`, 35);
+      const resolved = await resolvePdfByNameOnServer(payload.file.name);
+      if (resolved) {
+        const slot: PdfSlotMeta = {
+          id: resolved.pdfId,
+          label: resolved.label,
+          fileName: resolved.fileName,
+          sizeBytes: resolved.sizeBytes,
+          mtimeMs: resolved.mtimeMs,
+          initialPage: 1,
+          streamUrl: resolved.streamUrl,
+        };
+        state.pdfs = [slot];
+        state.activeIndex = 0;
+        state.localFileName = null;
+        await loadRegisteredPdf(slot);
+        return;
+      }
+    }
+    showError(readErr instanceof Error ? readErr.message : String(readErr));
   }
 }
 
