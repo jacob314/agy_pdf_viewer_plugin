@@ -247,9 +247,9 @@ const SharedViewerArgs = {
     .optional()
     .describe('Page layout: "single" (one page at a time, default), "spread" (2-page book spread), or "scroll" (continuous vertical scroll)'),
   zoom: z
-    .enum(['fit-width', 'fit-page', 'actual'])
+    .enum(['fit-page', 'fit-width', 'actual'])
     .optional()
-    .describe('Initial zoom mode: "fit-width" (default), "fit-page", or "actual" (100%)'),
+    .describe('Initial zoom mode: "fit-page" (default), "fit-width", or "actual" (100%)'),
   height: z
     .number()
     .int()
@@ -301,7 +301,7 @@ function buildSessionResult(
   let effectiveTitle = args.title;
   let effectiveActive = args.activeIndex ?? 0;
   let effectiveViewMode: ViewMode = args.viewMode ?? 'single';
-  let effectiveZoom: ZoomMode = args.zoom ?? 'fit-width';
+  let effectiveZoom: ZoomMode = args.zoom ?? 'fit-page';
   let effectiveHeight = Math.min(780, Math.max(320, args.height ?? 640));
 
   if (effectiveFiles.length === 0) {
@@ -532,7 +532,7 @@ server.registerTool(
           title: updatedMeta.label,
           activeIndex: 0,
           viewMode: 'single',
-          zoomMode: 'fit-width',
+          zoomMode: 'fit-page',
           inlineHeight: 640,
           pdfs: [updatedMeta],
         };
@@ -571,7 +571,7 @@ server.registerTool(
       currentPage: z.number().int().min(1).default(1),
       title: z.string().optional(),
       viewMode: z.enum(['single', 'spread', 'scroll']).default('single'),
-      zoomMode: z.enum(['fit-width', 'fit-page', 'actual']).default('fit-width'),
+      zoomMode: z.enum(['fit-page', 'fit-width', 'actual']).default('fit-page'),
     },
     _meta: {
       ui: {

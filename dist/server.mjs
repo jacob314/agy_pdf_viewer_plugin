@@ -21717,7 +21717,7 @@ var SharedViewerArgs = {
   activeIndex: external_exports.number().int().min(0).max(4).optional().describe("0-based index of the active PDF tab when passing multiple files (default 0)"),
   title: external_exports.string().optional().describe("Optional header title for the viewer"),
   viewMode: external_exports.enum(["single", "spread", "scroll"]).optional().describe('Page layout: "single" (one page at a time, default), "spread" (2-page book spread), or "scroll" (continuous vertical scroll)'),
-  zoom: external_exports.enum(["fit-width", "fit-page", "actual"]).optional().describe('Initial zoom mode: "fit-width" (default), "fit-page", or "actual" (100%)'),
+  zoom: external_exports.enum(["fit-page", "fit-width", "actual"]).optional().describe('Initial zoom mode: "fit-page" (default), "fit-width", or "actual" (100%)'),
   height: external_exports.number().int().min(320).max(780).optional().describe("Inline frame height in pixels (320-780, default 640; ignored in side panel)")
 };
 function normalizeFileArgs(args) {
@@ -21744,7 +21744,7 @@ function buildSessionResult(layout, args) {
   let effectiveTitle = args.title;
   let effectiveActive = args.activeIndex ?? 0;
   let effectiveViewMode = args.viewMode ?? "single";
-  let effectiveZoom = args.zoom ?? "fit-width";
+  let effectiveZoom = args.zoom ?? "fit-page";
   let effectiveHeight = Math.min(780, Math.max(320, args.height ?? 640));
   if (effectiveFiles.length === 0) {
     const prev = loadLastSession();
@@ -21941,7 +21941,7 @@ server.registerTool(
           title: updatedMeta.label,
           activeIndex: 0,
           viewMode: "single",
-          zoomMode: "fit-width",
+          zoomMode: "fit-page",
           inlineHeight: 640,
           pdfs: [updatedMeta]
         };
@@ -21977,7 +21977,7 @@ server.registerTool(
       currentPage: external_exports.number().int().min(1).default(1),
       title: external_exports.string().optional(),
       viewMode: external_exports.enum(["single", "spread", "scroll"]).default("single"),
-      zoomMode: external_exports.enum(["fit-width", "fit-page", "actual"]).default("fit-width")
+      zoomMode: external_exports.enum(["fit-page", "fit-width", "actual"]).default("fit-page")
     },
     _meta: {
       ui: {

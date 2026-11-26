@@ -66,7 +66,7 @@ const state: ViewerState = {
   numPages: 0,
   currentPage: 1,
   viewMode: 'single',
-  zoomSetting: 'fit-width',
+  zoomSetting: 'fit-page',
   computedScale: 1,
   rotation: 0,
   sidebarOpen: false,
@@ -1090,7 +1090,7 @@ function applySessionPayload(payload: PdfSessionPayload): void {
   state.pdfs = payload.pdfs || [];
   state.activeIndex = Math.min(Math.max(0, payload.activeIndex ?? 0), Math.max(0, state.pdfs.length - 1));
   state.viewMode = payload.viewMode || 'single';
-  state.zoomSetting = payload.zoomMode || 'fit-width';
+  state.zoomSetting = payload.zoomMode || 'fit-page';
   state.rotation = 0;
   state.localFileName = null;
 
@@ -1115,7 +1115,7 @@ async function applyFileViewerPayload(payload: PdfFileViewerPayload): Promise<vo
   state.pdfs = [];
   state.activeIndex = 0;
   state.viewMode = 'single';
-  state.zoomSetting = 'fit-width';
+  state.zoomSetting = 'fit-page';
   state.rotation = 0;
   state.localFileName = payload.file.name;
   renderTabs();
@@ -1258,7 +1258,7 @@ async function promoteToSidePanel(): Promise<void> {
 
   try {
     const zoomMode: ZoomMode =
-      typeof state.zoomSetting === 'string' ? state.zoomSetting : 'fit-width';
+      typeof state.zoomSetting === 'string' ? state.zoomSetting : 'fit-page';
     const promoRes = await app.callServerTool({
       name: 'promote_pdf_to_pane',
       arguments: {
@@ -1538,7 +1538,7 @@ window.addEventListener('keydown', (e) => {
     adjustZoom(1 / 1.2);
   } else if (e.key === '0') {
     e.preventDefault();
-    state.zoomSetting = 'fit-width';
+    state.zoomSetting = 'fit-page';
     void renderCurrentView(true);
   } else if (e.key === '/') {
     e.preventDefault();

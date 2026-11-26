@@ -37,7 +37,7 @@ Single PDF inline:
   "path": "/absolute/path/to/document.pdf",
   "page": 1,
   "viewMode": "single",
-  "zoom": "fit-width"
+  "zoom": "fit-page"
 }
 ```
 
@@ -70,7 +70,7 @@ Compare up to 5 PDFs in tabs:
 - `activeIndex` *(integer 0–4, optional)*: Initially active tab index when `files` is provided (default `0`).
 - `title` *(string, optional)*: Header title override.
 - `viewMode` *(`"single"` | `"spread"` | `"scroll"`, optional)*: Page layout (default `"single"`).
-- `zoom` *(`"fit-width"` | `"fit-page"` | `"actual"`, optional)*: Initial zoom mode (default `"fit-width"`).
+- `zoom` *(`"fit-page"` | `"fit-width"` | `"actual"`, optional)*: Initial zoom mode (default `"fit-page"`).
 - `height` *(integer 320–780, optional)*: Inline frame height in pixels (default `640`; ignored in side panel).
 
 ## Best Practices

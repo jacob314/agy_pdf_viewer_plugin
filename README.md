@@ -19,7 +19,7 @@ An interactive [Antigravity](https://antigravity.google) / Jetski plugin (`pdf-v
   - **3 View Modes**: Single Page, **2-Page Book Spread (`S`)** (cover solo, then 2–3, 4–5…), and **Continuous Scroll (`C`)** with lazy rendering.
   - **Selectable Text Layer & Full-Text Search (`/` or `⌘F`)**: Copy text directly from rendered pages or search across the entire document with match counts and yellow/orange highlights.
   - **Collapsible Sidebar (`T`)**: Lazy-rendered page thumbnails and clickable PDF Outline / Table of Contents bookmarks.
-  - **Zoom & Rotation**: Fit Width (`0`), Fit Page, 50%–300%, `+` / `-`, `⌘`/Ctrl + scroll wheel, and 90° clockwise rotation (`R`).
+  - **Zoom & Rotation**: Fit Page (`0`, default), Fit Width, 50%–300%, `+` / `-`, `⌘`/Ctrl + scroll wheel, and 90° clockwise rotation (`R`).
   - **Multi-PDF Tabs**: Pass up to 5 PDFs to compare revisions or documents side-by-side in tabs.
 
 ---
@@ -56,7 +56,7 @@ Or simply **click any `.pdf` file** in Antigravity to open it directly in the PD
 | :--- | :--- |
 | **`←` / `→`** or **`k` / `j`** | Previous / Next page (or spread) |
 | **`+` / `-`** or **`⌘` + Scroll** | Zoom in / out |
-| **`0`** | Fit Width |
+| **`0`** | Fit Page |
 | **`S`** | Toggle **2-Page Book Spread** |
 | **`C`** | Toggle **Continuous Scroll** |
 | **`T`** | Toggle **Thumbnails & Table of Contents** sidebar |
